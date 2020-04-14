@@ -42,29 +42,36 @@ int safeOpen(const char *file_path, int flags, mode_t mode = 0) {
 }
 
 void readText(const char *fp, unordered_map<string, uint32_t> &word_count) {
-  string cur_word;
+  int cur_word_size = 0;
+  const char* cur_word_start = nullptr;
   uint64_t total = 0;
-  auto deal_with_char = [&](char cur_char){
-    if (cur_char == ' ' || cur_char == '\n') {
-      if (cur_word.size() == 0)
+  auto deal_with_char = [&](const char* pcur_char){
+    if (*pcur_char == ' ' || *pcur_char == '\n' || !*pcur_char) {
+      if (cur_word_size == 0) {
+        cur_word_start = pcur_char + 1;
         return;
+      }
       // end of word
+      string cur_word(cur_word_start, cur_word_size);
       auto it = word_count.find(cur_word);
       int count = it != word_count.end() ? it->second : 0;
       word_count[cur_word] = count + 1;
       total++;
-      cur_word.clear();
+      cur_word_size = 0;
+      cur_word_start = pcur_char + 1;
     } else {
-      cur_word.push_back(cur_char);
+      ++cur_word_size;
     }
   };
 
   if (string(fp).compare("-") == 0) {
     for (std::string line; std::getline(std::cin, line);) {
-      for(char c: line){
-        deal_with_char(c);
+      auto pline = line.data();
+      cur_word_start = pline;
+      for(int i=0;i<=line.length();++i) {
+        deal_with_char(pline);
+        pline++;
       }
-      deal_with_char('\n');
     }
   }
   else {
@@ -76,9 +83,10 @@ void readText(const char *fp, unordered_map<string, uint32_t> &word_count) {
 
     size_t size = s.st_size;
     char *f = (char *)mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    cur_word_start = f;
 
     for (size_t i = 0; i < size; i++) {
-      deal_with_char(f[i]);
+      deal_with_char(f+i);
     }
   }
   fprintf(stderr, "Read %lu words (%lu unique) from text file.\n", total,
@@ -167,14 +175,23 @@ struct pair_hash {
 void tokenize(const unordered_map<string, uint32_t> &word_count,
               unordered_map<string, uint32_t> &token_to_int,
               vector<string> &int_to_token, vector<list<uint32_t>> &words,
-              vector<int32_t> &counts) {
+              vector<int32_t> &counts,
+              // it's guaranteed special tokens are already in the token dict.
+              const set<string> &special_tokens) {
 
+  cerr << "tokenizing..." << endl;
   for (auto &x : word_count) {
     auto &word = x.first;
 
     words.push_back(list<uint32_t>());
     auto &current_word = words.back();
     counts.push_back(x.second);
+
+    // push sp token directly without scanning.
+    if (special_tokens.find(word) != special_tokens.end()) {
+      current_word.push_back(token_to_int[word]);
+      continue;
+    }
 
     int pos = 0, realLength = 0;
     int lastStart = 0;
@@ -203,11 +220,19 @@ void tokenize(const unordered_map<string, uint32_t> &word_count,
 }
 
 void tokenize_str(const unordered_map<string, uint32_t> &word_count,
-                  unordered_map<string, vector<string>> &words) {
+                  unordered_map<string, vector<string>> &words,
+                  // it's guaranteed special tokens are already in the token dict.
+                  const set<string> &special_tokens) {
 
   for (auto &x : word_count) {
     auto &word = x.first;
     words[word] = vector<string>();
+
+    // push sp token directly without scanning.
+    if (special_tokens.find(word) != special_tokens.end()) {
+      words[word].push_back(word);
+      continue;
+    }
 
     int pos = 0, realLength = 0;
     int lastStart = 0;
@@ -227,8 +252,11 @@ void tokenize_str(const unordered_map<string, uint32_t> &word_count,
   }
 }
 
+// a pair of tokens
 using tp = pair<uint32_t, uint32_t>;
+// a pair of strings
 using tps = pair<string, string>;
+// pair counts
 using pc = unordered_map<tp, pair<int32_t, tp> *, pair_hash>;
 
 void count_in_word(
@@ -308,13 +336,21 @@ void learnbpe(const uint32_t kNPairs, const char *inputFile1,
   }
 
   // a token is an int, it represents a string
-  unordered_map<string, uint32_t> token_to_int;
+  // !! note, the special tokens are undecomposable whole-word units.
+  // so they will never appear in the learned bpe representation.
+  set<string> special_tokens = {"<unk>", "<url>", "<file>", "<email>"};
   vector<string> int_to_token;
+  unordered_map<string, uint32_t> token_to_int;
+
+  int_to_token.insert(int_to_token.end(), special_tokens.begin(), special_tokens.end());
+  for(int i=0;i<special_tokens.size();++i) {
+    token_to_int[int_to_token[i]] = i;
+  }
 
   vector<list<uint32_t>> words;
   vector<int32_t> counts;
 
-  tokenize(word_count, token_to_int, int_to_token, words, counts);
+  tokenize(word_count, token_to_int, int_to_token, words, counts, special_tokens);
 
   vector<pair<int32_t, tp>> contiguous_counts;
   contiguous_counts.reserve(kMaxPairs);
@@ -596,8 +632,9 @@ void applybpe(const char *outputFile, const char *inputFile,
   readText(inputFile, word_count);
 
   // tokenize
+  set<string> special_tokens = {"<unk>", "<url>", "<file>", "<email>"};
   unordered_map<string, vector<string>> bpeTok;
-  tokenize_str(word_count, bpeTok);
+  tokenize_str(word_count, bpeTok, special_tokens);
 
   vector<pair<string, vector<string>>> bpeTokVec;
   for (auto x : bpeTok) {
@@ -625,6 +662,11 @@ void applybpe(const char *outputFile, const char *inputFile,
     for (auto x : bpe[i]) {
       final_bpe[x.first] = x.second;
     }
+  }
+
+  // insert sp into the final bpe'ed vocabulary.
+  for (auto &sp : special_tokens) {
+    final_bpe[sp] = sp;
   }
   // output
   outputText(outputFile, inputFile, final_bpe);
